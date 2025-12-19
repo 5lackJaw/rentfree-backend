@@ -11,6 +11,11 @@ const SOLANA_RPC_URL =
 const TOKEN_MINT = process.env.TOKEN_MINT; // set to your mint (same as in frontend)
 const MAX_ROOMS = 80; // how many rooms to show
 const LANDLORD_TOP_N = 10;
+const CACHE_TTL_MS = 30 * 1000; // 30s cache to stay under RPC limits
+
+let roomsCache = null;
+let roomsCacheMint = null;
+let roomsCacheUpdatedAt = 0;
 
 // ---- SETUP ----
 if (!TOKEN_MINT) {
@@ -62,29 +67,37 @@ function hashToRoom(wallet, maxRooms) {
 app.get("/api/rooms", async (req, res) => {
   try {
     const mint = req.query.mint ? new PublicKey(req.query.mint) : mintPubkey;
+    const mintBase58 = mint.toBase58();
+    const now = Date.now();
 
-    // SPL Token Program ID
+    // serve from cache when mint matches and data is fresh
+    if (
+      roomsCache &&
+      roomsCacheMint === mintBase58 &&
+      now - roomsCacheUpdatedAt < CACHE_TTL_MS
+    ) {
+      return res.json({ rooms: roomsCache, cached: true });
+    }
+
     const TOKEN_PROGRAM_ID = new PublicKey(
       "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
     );
 
     const accounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
       filters: [
-        { dataSize: 165 }, // token account size
+        { dataSize: 165 },
         {
           memcmp: {
-            offset: 0, // mint is at start of account data
-            bytes: mint.toBase58()
+            offset: 0,
+            bytes: mintBase58
           }
         }
       ]
     });
 
-    // Decode balances manually from account data layout
     const holdersMap = new Map();
-    for (const { account, pubkey } of accounts) {
+    for (const { account } of accounts) {
       const data = account.data;
-      // amount is at offset 64 (u64 little-endian) in SPL Token account
       const amountBytes = data.slice(64, 72);
       let amount = 0n;
       for (let i = 0; i < 8; i++) {
@@ -99,10 +112,9 @@ app.get("/api/rooms", async (req, res) => {
 
     let holders = Array.from(holdersMap.entries()).map(([wallet, balance]) => ({
       walletAddress: wallet,
-      balance: Number(balance) // assumes non-insane decimals; adjust if needed
+      balance: Number(balance)
     }));
 
-    // sort by balance desc, take top MAX_ROOMS
     holders.sort((a, b) => b.balance - a.balance);
     const top = holders.slice(0, MAX_ROOMS);
 
@@ -111,7 +123,6 @@ app.get("/api/rooms", async (req, res) => {
       const roomNumber = hashToRoom(h.walletAddress, MAX_ROOMS);
       const nameRow = getNameStmt.get(h.walletAddress);
       const displayName = nameRow ? nameRow.name : null;
-      // you might want to divide by 10**decimals here to show human balance
       return {
         walletAddress: h.walletAddress,
         roomNumber,
@@ -121,9 +132,21 @@ app.get("/api/rooms", async (req, res) => {
       };
     });
 
-    res.json({ rooms: withRooms });
+    roomsCache = withRooms;
+    roomsCacheMint = mintBase58;
+    roomsCacheUpdatedAt = now;
+
+    res.json({ rooms: withRooms, cached: false });
   } catch (err) {
     console.error("Error in /api/rooms:", err);
+
+    const errStr = String(err?.message || err);
+    if (errStr.includes("429") || errStr.includes("Too many requests")) {
+      return res
+        .status(503)
+        .json({ error: "Upstream RPC rate-limited. Try again in a minute." });
+    }
+
     res.status(500).json({ error: "Failed to load rooms" });
   }
 });
