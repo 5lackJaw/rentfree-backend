@@ -11,6 +11,8 @@
     "better-sqlite3": "^9.0.0",
     "cors": "^2.8.5",
     "express": "^4.19.0",
-    "tweetnacl": "^1.0.3"
+    "tweetnacl": "1.0.3"
+
   }
 }
+
